@@ -1,0 +1,203 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import BertModel, BertTokenizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+class LiteratureContrastiveLearning:
+    def __init__(self, model_name='bert-base-uncased', batch_size=32, temperature=0.07):
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.model = BertModel.from_pretrained(model_name)
+        self.batch_size = batch_size
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=2e-5)
+        
+    class ContrastiveDataset(Dataset):
+        def __init__(self, phrases, tokenizer, max_length=128):
+            self.phrases = phrases
+            self.tokenizer = tokenizer
+            self.max_length = max_length
+            
+        def __len__(self):
+            return len(self.phrases)
+            
+        def __getitem__(self, idx):
+            # For each phrase, create an anchor-positive pair
+            anchor = self.phrases[idx]
+            # Create positive sample (slight modification of same phrase)
+            positive = self.augment_text(anchor)
+            
+            # Tokenize both texts
+            anchor_encoding = self.tokenizer(anchor, 
+                                          max_length=self.max_length,
+                                          padding='max_length',
+                                          truncation=True,
+                                          return_tensors='pt')
+            
+            positive_encoding = self.tokenizer(positive, 
+                                            max_length=self.max_length,
+                                            padding='max_length',
+                                            truncation=True,
+                                            return_tensors='pt')
+            
+            return {
+                'anchor_ids': anchor_encoding['input_ids'].squeeze(),
+                'anchor_mask': anchor_encoding['attention_mask'].squeeze(),
+                'positive_ids': positive_encoding['input_ids'].squeeze(),
+                'positive_mask': positive_encoding['attention_mask'].squeeze()
+            }
+            
+        def augment_text(self, text):
+            # Simple text augmentation (in a real scenario, use more sophisticated methods)
+            words = text.split()
+            if len(words) <= 1:
+                return text
+                
+            # Random word deletion
+            if len(words) > 3 and np.random.random() < 0.5:
+                del_idx = np.random.randint(0, len(words))
+                words.pop(del_idx)
+                
+            return ' '.join(words)
+    
+    def extract_embeddings(self, text_list):
+        """Extract BERT embeddings for a list of texts"""
+        embeddings = []
+        
+        for text in text_list:
+            inputs = self.tokenizer(text, return_tensors='pt', 
+                                   padding=True, truncation=True, max_length=128)
+            
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                # Use CLS token as the sentence embedding
+                embedding = outputs.last_hidden_state[:, 0, :].numpy()
+                embeddings.append(embedding.squeeze())
+                
+        return np.array(embeddings)
+    
+    def train(self, phrases, num_epochs=10):
+        """Train the contrastive learning model"""
+        dataset = self.ContrastiveDataset(phrases, self.tokenizer)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        
+        self.model.train()
+        
+        for epoch in range(num_epochs):
+            total_loss = 0
+            
+            for batch in dataloader:
+                # Get embeddings for anchors
+                anchor_outputs = self.model(
+                    input_ids=batch['anchor_ids'],
+                    attention_mask=batch['anchor_mask']
+                )
+                anchor_embeddings = anchor_outputs.last_hidden_state[:, 0, :]  # CLS token
+                
+                # Get embeddings for positives
+                positive_outputs = self.model(
+                    input_ids=batch['positive_ids'],
+                    attention_mask=batch['positive_mask']
+                )
+                positive_embeddings = positive_outputs.last_hidden_state[:, 0, :]
+                
+                # Normalize embeddings
+                anchor_embeddings = nn.functional.normalize(anchor_embeddings, dim=1)
+                positive_embeddings = nn.functional.normalize(positive_embeddings, dim=1)
+                
+                # Concatenate embeddings from the batch
+                embeddings = torch.cat([anchor_embeddings, positive_embeddings], dim=0)
+                
+                # Create similarity matrix
+                similarity_matrix = torch.matmul(embeddings, embeddings.T)
+                
+                # Mask out self-similarity
+                mask = torch.eye(similarity_matrix.shape[0], dtype=torch.bool)
+                similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
+                
+                # Apply temperature scaling
+                similarity_matrix /= self.temperature
+                
+                # Create labels for the positive pairs
+                batch_size = anchor_embeddings.shape[0]
+                labels = torch.arange(batch_size, device=similarity_matrix.device)
+                labels = torch.cat([labels + batch_size, labels], dim=0)
+                
+                # Calculate contrastive loss
+                loss = self.criterion(similarity_matrix, labels)
+                
+                # Backpropagation
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+    
+    def compute_semantic_similarity(self, phrases):
+        """Compute semantic similarity matrix for the given phrases"""
+        # Extract embeddings for all phrases
+        embeddings = self.extract_embeddings(phrases)
+        
+        # Compute cosine similarity
+        similarity_matrix = cosine_similarity(embeddings)
+        
+        return similarity_matrix
+    
+    def select_top_phrases(self, phrases, frequencies, top_n=100):
+        """Select top phrases based on frequency and semantic relevance"""
+        if len(phrases) <= top_n:
+            return phrases
+            
+        # Extract embeddings
+        embeddings = self.extract_embeddings(phrases)
+        
+        # Compute similarity matrix
+        similarity_matrix = cosine_similarity(embeddings)
+        
+        # Normalize frequencies
+        norm_frequencies = np.array(frequencies) / max(frequencies)
+        
+        # Calculate average similarity score for each phrase
+        avg_similarities = np.mean(similarity_matrix, axis=1)
+        
+        # Combine frequency and semantic relevance
+        scores = 0.7 * norm_frequencies + 0.3 * avg_similarities
+        
+        # Select top phrases
+        top_indices = np.argsort(scores)[-top_n:]
+        selected_phrases = [phrases[i] for i in top_indices]
+        
+        return selected_phrases
+
+# Example usage
+if __name__ == "__main__":
+    # Sample candidate phrases
+    candidate_phrases = [
+        "Contrastive Learning", "Hyperspherical Embedding", "Hierarchical Structure",
+        "Semantic Relevance", "Text Mining", "Knowledge Representation",
+        "Document Classification", "Expert Validation", "Hierarchical Fidelity Score",
+        "Clustering Analysis", "Delphi Method", "Indicator System"
+    ]
+    
+    frequencies = [187, 142, 134, 129, 126, 119, 115, 112, 106, 103, 97, 92]
+    
+    # Initialize contrastive learning model
+    cl_model = LiteratureContrastiveLearning()
+    
+    # Train the model (in practice, would use more data)
+    cl_model.train(candidate_phrases, num_epochs=5)
+    
+    # Select top phrases
+    top_phrases = cl_model.select_top_phrases(candidate_phrases, frequencies, top_n=8)
+    print("Selected top phrases:", top_phrases)
+    
+    # Compute semantic similarity matrix
+    similarity_matrix = cl_model.compute_semantic_similarity(top_phrases)
+    print("Semantic similarity matrix:")
+    print(similarity_matrix)

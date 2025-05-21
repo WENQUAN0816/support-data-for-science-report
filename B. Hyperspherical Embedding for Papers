@@ -1,0 +1,320 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset
+import networkx as nx
+
+class HypersphericalEmbedding:
+    def __init__(self, dim=128, temperature=0.1):
+        """
+        Initialize Hyperspherical Embedding model
+        
+        Args:
+            dim: dimensionality of the embedding space
+            temperature: temperature parameter for softmax
+        """
+        self.dim = dim
+        self.temperature = temperature
+        self.hierarchical_relations = {}
+        
+    class HierarchicalDataset(Dataset):
+        def __init__(self, relations, num_indicators):
+            """
+            Dataset for training hyperspherical embeddings
+            
+            Args:
+                relations: dictionary mapping each node to its parent nodes
+                num_indicators: total number of indicators
+            """
+            self.parent_child_pairs = []
+            self.negative_samples = []
+            
+            # Create positive samples (parent-child pairs)
+            for child, parents in relations.items():
+                for parent in parents:
+                    self.parent_child_pairs.append((parent, child))
+            
+            # Create negative samples (non-related pairs)
+            all_indicators = list(range(num_indicators))
+            for i in range(num_indicators):
+                # Find indicators that are not parents of i
+                possible_neg = [j for j in all_indicators if j not in relations.get(i, [])]
+                # Sample a few negative examples
+                if possible_neg:
+                    neg_samples = np.random.choice(possible_neg, 
+                                                  size=min(5, len(possible_neg)), 
+                                                  replace=False)
+                    for neg in neg_samples:
+                        self.negative_samples.append((i, neg))
+        
+        def __len__(self):
+            return len(self.parent_child_pairs) + len(self.negative_samples)
+        
+        def __getitem__(self, idx):
+            if idx < len(self.parent_child_pairs):
+                # Return a positive pair with label 1
+                pair = self.parent_child_pairs[idx]
+                return {"parent": pair[0], "child": pair[1], "label": 1.0}
+            else:
+                # Return a negative pair with label 0
+                pair = self.negative_samples[idx - len(self.parent_child_pairs)]
+                return {"parent": pair[0], "child": pair[1], "label": 0.0}
+    
+    class HypersphericalModel(nn.Module):
+        def __init__(self, num_indicators, dim):
+            super().__init__()
+            # Initialize embeddings on the unit hypersphere
+            self.embeddings = nn.Parameter(torch.randn(num_indicators, dim))
+            # Normalize to unit sphere
+            with torch.no_grad():
+                self.embeddings.data = nn.functional.normalize(self.embeddings.data, dim=1)
+        
+        def forward(self, parent_indices, child_indices):
+            # Get parent and child embeddings
+            parent_embeds = nn.functional.normalize(self.embeddings[parent_indices], dim=1)
+            child_embeds = nn.functional.normalize(self.embeddings[child_indices], dim=1)
+            
+            # Compute cosine similarity
+            similarity = torch.sum(parent_embeds * child_embeds, dim=1)
+            return similarity
+    
+    def add_hierarchical_relation(self, child, parents):
+        """Add hierarchical relation: child has multiple parents"""
+        if child not in self.hierarchical_relations:
+            self.hierarchical_relations[child] = []
+        
+        # Add parents (avoid duplicates)
+        for parent in parents:
+            if parent not in self.hierarchical_relations[child]:
+                self.hierarchical_relations[child].append(parent)
+    
+    def construct_graph(self):
+        """Construct a directed graph from hierarchical relations"""
+        G = nx.DiGraph()
+        
+        # Add nodes and edges
+        for child, parents in self.hierarchical_relations.items():
+            G.add_node(child)
+            for parent in parents:
+                G.add_node(parent)
+                G.add_edge(parent, child)
+        
+        return G
+    
+    def train(self, num_indicators, batch_size=32, num_epochs=100, lr=0.01):
+        """Train the hyperspherical embedding model"""
+        # Create dataset
+        dataset = self.HierarchicalDataset(self.hierarchical_relations, num_indicators)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        # Initialize model
+        model = self.HypersphericalModel(num_indicators, self.dim)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.BCEWithLogitsLoss()
+        
+        # Training loop
+        for epoch in range(num_epochs):
+            total_loss = 0.0
+            
+            for batch in dataloader:
+                parent_indices = batch['parent']
+                child_indices = batch['child']
+                labels = batch['label']
+                
+                # Forward pass
+                similarities = model(parent_indices, child_indices)
+                
+                # Apply temperature
+                similarities = similarities / self.temperature
+                
+                # Convert similarities to probabilities with sigmoid
+                loss = criterion(similarities, labels)
+                
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                # Re-normalize embeddings to unit sphere
+                with torch.no_grad():
+                    model.embeddings.data = nn.functional.normalize(model.embeddings.data, dim=1)
+                
+                total_loss += loss.item()
+            
+            # Print progress
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss/len(dataloader):.4f}")
+        
+        # Save the trained embeddings
+        self.embeddings = model.embeddings.detach().numpy()
+        
+        return self.embeddings
+    
+    def compute_hierarchical_fidelity_score(self):
+        """Compute Hierarchical Fidelity Score (HFS)"""
+        if not hasattr(self, 'embeddings'):
+            raise ValueError("Model must be trained before computing HFS")
+        
+        total_pairs = 0
+        correct_hierarchies = 0
+        
+        # Check all parent-child relationships
+        for child, parents in self.hierarchical_relations.items():
+            child_embed = self.embeddings[child]
+            
+            for parent in parents:
+                parent_embed = self.embeddings[parent]
+                
+                # Check if parent-child cosine similarity is high
+                parent_child_sim = np.dot(parent_embed, child_embed)
+                
+                # Find random non-parent indicators
+                all_indicators = list(range(len(self.embeddings)))
+                non_parents = [i for i in all_indicators if i not in parents and i != child]
+                
+                if non_parents:
+                    # Sample a non-parent
+                    non_parent = np.random.choice(non_parents)
+                    non_parent_embed = self.embeddings[non_parent]
+                    
+                    # Calculate similarity with non-parent
+                    non_parent_sim = np.dot(non_parent_embed, child_embed)
+                    
+                    # Check if parent similarity > non-parent similarity
+                    if parent_child_sim > non_parent_sim:
+                        correct_hierarchies += 1
+                    
+                    total_pairs += 1
+        
+        if total_pairs == 0:
+            return 0.0
+            
+        # Calculate HFS
+        hfs = correct_hierarchies / total_pairs
+        return hfs
+    
+    def visualize_embeddings(self, labels=None, save_path=None):
+        """Visualize hyperspherical embeddings using t-SNE"""
+        if not hasattr(self, 'embeddings'):
+            raise ValueError("Model must be trained before visualization")
+        
+        # Apply t-SNE for dimensionality reduction
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(self.embeddings)-1))
+        embeddings_2d = tsne.fit_transform(self.embeddings)
+        
+        # Set up the plot
+        plt.figure(figsize=(10, 8))
+        
+        # Plot points
+        if labels is not None:
+            unique_labels = list(set(labels))
+            colors = plt.cm.rainbow(np.linspace(0, 1, len(unique_labels)))
+            
+            for i, label in enumerate(unique_labels):
+                indices = [j for j, l in enumerate(labels) if l == label]
+                plt.scatter(embeddings_2d[indices, 0], embeddings_2d[indices, 1], 
+                         color=colors[i], label=label, alpha=0.7)
+            plt.legend()
+        else:
+            plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], alpha=0.7)
+        
+        # Add labels if provided
+        if labels is not None:
+            for i, (x, y) in enumerate(embeddings_2d):
+                plt.annotate(str(i), (x, y), fontsize=9, alpha=0.7)
+        
+        plt.title("Hyperspherical Embedding Visualization (t-SNE)")
+        plt.xlabel("t-SNE Dimension 1")
+        plt.ylabel("t-SNE Dimension 2")
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        plt.show()
+        
+        return embeddings_2d
+        
+    def compare_with_euclidean(self, labels=None):
+        """Compare hyperspherical embeddings with Euclidean embeddings"""
+        if not hasattr(self, 'embeddings'):
+            raise ValueError("Model must be trained before comparison")
+            
+        # Train a simple Euclidean embedding model (simplified for comparison)
+        euclidean_model = self.train_euclidean_model()
+        
+        # Compute HFS for both models
+        hyperspherical_hfs = self.compute_hierarchical_fidelity_score()
+        
+        # Store original embeddings
+        original_embeddings = self.embeddings.copy()
+        
+        # Temporarily replace with Euclidean embeddings
+        self.embeddings = euclidean_model
+        euclidean_hfs = self.compute_hierarchical_fidelity_score()
+        
+        # Restore original embeddings
+        self.embeddings = original_embeddings
+        
+        print(f"Hyperspherical HFS: {hyperspherical_hfs:.4f}")
+        print(f"Euclidean HFS: {euclidean_hfs:.4f}")
+        
+        return {
+            "hyperspherical_hfs": hyperspherical_hfs,
+            "euclidean_hfs": euclidean_hfs,
+            "improvement": hyperspherical_hfs - euclidean_hfs
+        }
+    
+    def train_euclidean_model(self):
+        """Train a simple Euclidean embedding model for comparison"""
+        # Create a simple Euclidean model (without normalization constraints)
+        num_indicators = len(self.embeddings)
+        euclidean_embeddings = np.random.randn(num_indicators, self.dim)
+        
+        # Simplified training (just for demonstration)
+        for _ in range(50):
+            for child, parents in self.hierarchical_relations.items():
+                child_embed = euclidean_embeddings[child]
+                
+                # Move child closer to parents
+                for parent in parents:
+                    parent_embed = euclidean_embeddings[parent]
+                    # Move slightly towards parent
+                    child_embed = 0.9 * child_embed + 0.1 * parent_embed
+                
+                # Update embedding
+                euclidean_embeddings[child] = child_embed
+        
+        return euclidean_embeddings
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize model
+    model = HypersphericalEmbedding(dim=64, temperature=0.1)
+    
+    # Define hierarchical relations (child: [parents])
+    # Example: Indicator 0 has parents 1 and 2
+    model.add_hierarchical_relation(0, [1, 2])
+    model.add_hierarchical_relation(3, [1, 4])
+    model.add_hierarchical_relation(5, [2, 6])
+    model.add_hierarchical_relation(7, [4, 8])
+    model.add_hierarchical_relation(9, [6, 8])
+    
+    # Train the model
+    num_indicators = 10  # Total number of indicators
+    embeddings = model.train(num_indicators, batch_size=4, num_epochs=100)
+    
+    # Compute Hierarchical Fidelity Score
+    hfs = model.compute_hierarchical_fidelity_score()
+    print(f"Hierarchical Fidelity Score: {hfs:.4f}")
+    
+    # Compare with Euclidean embedding
+    comparison = model.compare_with_euclidean()
+    
+    # Visualize embeddings
+    # Assign each indicator to a cluster for visualization
+    clusters = [0, 1, 1, 2, 2, 3, 3, 4, 4, 0]
+    model.visualize_embeddings(labels=clusters, save_path="hyperspherical_embeddings.png")
